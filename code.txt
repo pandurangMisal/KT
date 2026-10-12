@@ -1,0 +1,1437 @@
+
+
+#include "Rte_CDDTeleBackupMngr.h"
+
+
+/**********************************************************************************************************************
+ * DO NOT CHANGE THIS COMMENT!           << Start of include and declaration area >>        DO NOT CHANGE THIS COMMENT!
+ *********************************************************************************************************************/
+#include "CDDTeleBackupMngr.h"
+#include "Csm.h"
+#include "NvM_Cfg.h"
+#include "NvM.h"
+#include "telematics_csu_table.h"
+#include "stdint.h"				   
+#include "Tele_Comp_Common.h"	
+		   
+#define BACKUP_DATA_SIZE                10U
+#define SEG_INFO_SIZE                   8U
+#define CDDTBM_SEG_INFO_SIZE			8u
+
+static backupStat NVM_Back_up_status; //enum defined in CddTelematicsProcessing							   
+static tele_sf_request_data_t data_transfer_info;	//struct for serial flash
+
+static uint32 block_cmac_addr_reference;	//Reference address of block CMAC storage
+static uint32 TeleRollBackTimeOut;	//global to calculate rollback time crossed
+static uint32 backup_Cipher_IV_Length = Cipher_IV_LENGTH;
+static uint32 backup_result_len_encrypt = SF_PAGE_SIZE;
+static uint32 backup_cmac_gen_length = CMAC_GEN_LENGTH;
+static uint8 Mem_Read_Buff[SF_PAGE_SIZE] = {0};	//array contain plain text from Program flash					   
+static uint8 backup_encrypt_data[SF_PAGE_SIZE] = {0};	//array containg encrypted data
+static uint8 CMAC_array[CMAC_GEN_LENGTH] = {0};	//CMAC array of 16 bytes
+static uint8 Backup_Cipher_IV[Cipher_IV_LENGTH];
+static uint8 Rollback_timer_status ;
+#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+	static uint16 page_counter;				 
+#endif	
+						   
+/**********metadata variable*****************/
+static csu_metadata csu_header_backup;	//struct metadata defined in CddTelematicsProcessing
+static uint8 backup_matadata_array[2*SF_PAGE_SIZE] = {0};	
+static uint16 metadata_length;
+
+/**********CR#17113464:Cybersecurity event logging support for CSU Events- CddBackupMngr*****************/
+#define UPDATE_FAILURE 2U
+static uint8 Update_Failure_ReasonCode[2] = {13,67};
+
+/*CR#17782216: Telematics Back Up Status as zero */
+static uint8 NvM_backup_update = 0u;
+static uint8 NvM_Error_status = 0u;
+static uint8 schdlr_NvM_WriteBlock_rtn = 0u;
+static uint8 init_NvM_WriteBlock_rtn = 0u;
+static uint8 Rollback_NvM_WriteBlock_rtn = 0u;
+
+/*CR#18134205: CSU Master Enable- Repurpose existing Trim - CddTELEBackupMangr */
+static boolean CSU_feature_enable = FALSE;
+
+
+/**********************************************************************************************************************
+ * DO NOT CHANGE THIS COMMENT!           << End of include and declaration area >>          DO NOT CHANGE THIS COMMENT!
+ *********************************************************************************************************************/
+
+
+/**********************************************************************************************************************
+ *
+ * Used AUTOSAR Data Types
+ *
+ **********************************************************************************************************************
+ *
+ * Primitive Types:
+ * ================
+ * uint32: Integer in interval [0...4294967295] (standard type)
+ * uint8: Integer in interval [0...255] (standard type)
+ *
+ *********************************************************************************************************************/
+
+
+/**********************************************************************************************************************
+ *
+ * APIs which are accessible from all runnable entities of the SW-C
+ *
+ **********************************************************************************************************************
+ * Calibration Parameters:
+ * =======================
+ *   SW-C local Calibration Parameters:
+ *   ----------------------------------
+ *   uint32 Rte_CData_caTeleRollBackTimer(void)
+ *
+ *********************************************************************************************************************/
+
+
+#define CDDTeleBackupMngr_START_SEC_CODE
+#include "CDDTeleBackupMngr_MemMap.h" /* PRQA S 5087 */ /* MD_MSR_MemMap */
+
+/**********************************************************************************************************************
+ *
+ * Runnable Entity Name: InitCDDTeleBackupMngr
+ *
+ *---------------------------------------------------------------------------------------------------------------------
+ *
+ * Executed once after the RTE is started
+ *
+ **********************************************************************************************************************
+ *
+ * Input Interfaces:
+ * =================
+ *   Explicit S/R API:
+ *   -----------------
+ *   Std_ReturnType Rte_Read_nvrBackupSfStartAddr_nvdVal(uint32 *data)
+ *   Std_ReturnType Rte_Read_nvrBackupStatus_nvdVal(uint8 *data)
+ *   Std_ReturnType Rte_Read_nvrBufferSfStartAddr_nvdVal(uint32 *data)
+ *   Std_ReturnType Rte_Read_nvrPortOverstatus_nvdVal(uint8 *data)
+ *   Std_ReturnType Rte_Read_nvrRollBackTimerStatus_nvdVal(uint8 *data)
+ *   Std_ReturnType Rte_Read_nvrTeleRollBackTimeOut_nvdVal(uint32 *data)
+ *   Std_ReturnType Rte_Read_ppToolConnectedProg_deVal(uint8 *data)
+ *
+ * Output Interfaces:
+ * ==================
+ *   Explicit S/R API:
+ *   -----------------
+ *   Std_ReturnType Rte_Write_nvwBackupSfStartAddr_nvdVal(uint32 data)
+ *   Std_ReturnType Rte_Write_nvwBackupStatus_nvdVal(uint8 data)
+ *   Std_ReturnType Rte_Write_nvwBufferSfStartAddr_nvdVal(uint32 data)
+ *   Std_ReturnType Rte_Write_nvwPortOverstatus_nvdVal(uint8 data)
+ *   Std_ReturnType Rte_Write_nvwRollBackTimerStatus_nvdVal(uint8 data)
+ *   Std_ReturnType Rte_Write_nvwTeleRollBackTimeOut_nvdVal(uint32 data)
+ *
+ *********************************************************************************************************************/
+/**********************************************************************************************************************
+ * DO NOT CHANGE THIS COMMENT!           << Start of documentation area >>                  DO NOT CHANGE THIS COMMENT!
+ * Symbol: reInitCDDTeleBackupMngr_doc
+ *********************************************************************************************************************/
+
+
+/**********************************************************************************************************************
+ * DO NOT CHANGE THIS COMMENT!           << End of documentation area >>                    DO NOT CHANGE THIS COMMENT!
+ *********************************************************************************************************************/
+
+FUNC(void, CDDTeleBackupMngr_CODE) reInitCDDTeleBackupMngr(void) /* PRQA S 0624, 3206 */ /* MD_Rte_0624, MD_Rte_3206 */
+{
+/**********************************************************************************************************************
+ * DO NOT CHANGE THIS COMMENT!           << Start of runnable implementation >>             DO NOT CHANGE THIS COMMENT!
+ * Symbol: InitCDDTeleBackupMngr
+ *********************************************************************************************************************/
+
+	nvmPortOverStat NVM_portover_status;
+	boolean new_cal_download;
+	
+	(void)Rte_Write_nvwBackupSfStartAddr_nvdVal((uint32)SF_BACKUP_CSU_METADATA_STRUCTURE_START);
+	(void)Rte_Write_nvwBufferSfStartAddr_nvdVal((uint32)SF_BUFFER_CSU_METADATA_STRUCTURE_START);																						 
+	(void)Rte_Read_nvrPortOverstatus_nvdVal(&NVM_portover_status);
+	(void)Rte_Read_ppToolConnectedProg_deVal(&new_cal_download);
+	(void)Rte_Read_nvrBackupStatus_nvdVal(&NVM_Back_up_status);
+	(void)Rte_Read_nvrRollBackTimerStatus_nvdVal(&Rollback_timer_status);
+	(void)Rte_Read_ppCSUFeatureEnbl_deVal(&CSU_feature_enable);
+	if(CSU_feature_enable == TRUE)
+	{
+		if ((NVM_portover_status == PORTOVER_COMPLETE) && (Rollback_timer_status != TRUE) && (NVM_Back_up_status != BACKUP_IN_PROGRESS))
+		{
+			Rollback_timer_status = 1;
+			TeleRollBackTimeOut = 0;
+			(void)Rte_Write_nvwRollBackTimerStatus_nvdVal(Rollback_timer_status);
+			(void)Rte_Write_nvwTeleRollBackTimeOut_nvdVal(TeleRollBackTimeOut);
+		}
+		else if((new_cal_download == 0x01)||(NVM_Back_up_status == BACKUP_FAILED))
+		{
+			NVM_Back_up_status = BACKUP_IN_PROGRESS;
+			
+		}
+		else
+		{
+			/*DO Nothing*/
+		}						  
+		
+
+	}
+	else
+	{
+		NVM_Back_up_status = CSU_FEATURE_DISABLE;
+		
+	}
+	
+	(void)Rte_Write_nvwBackupStatus_nvdVal((uint8)NVM_Back_up_status);	
+	init_NvM_WriteBlock_rtn = NvM_WriteBlock(NvMConf_NvMBlockDescriptor_NvbswcBootSharedBootSharedFBLGeneral, NULL_PTR);
+	if(init_NvM_WriteBlock_rtn == E_NOT_OK)
+	{
+		NvM_backup_update = TRUE;
+	}
+	else
+	{
+		/* DO NOTHING */
+	}
+
+/**********************************************************************************************************************
+ * DO NOT CHANGE THIS COMMENT!           << End of runnable implementation >>               DO NOT CHANGE THIS COMMENT!
+ *********************************************************************************************************************/
+}
+
+/**********************************************************************************************************************
+ *
+ * Runnable Entity Name: reCddTeleBackupSchdlr
+ *
+ *---------------------------------------------------------------------------------------------------------------------
+ *
+ * Executed if at least one of the following trigger conditions occurred:
+ *   - triggered on TimingEvent every 10ms
+ *
+ **********************************************************************************************************************
+ *
+ * Input Interfaces:
+ * =================
+ *   Explicit S/R API:
+ *   -----------------
+ *   Std_ReturnType Rte_Read_nvrBackupSfStartAddr_nvdVal(uint32 *data)
+ *   Std_ReturnType Rte_Read_nvrBackupStatus_nvdVal(uint8 *data)
+ *   Std_ReturnType Rte_Read_nvrBufferSfStartAddr_nvdVal(uint32 *data)
+ *   Std_ReturnType Rte_Read_nvrPortOverstatus_nvdVal(uint8 *data)
+ *   Std_ReturnType Rte_Read_nvrTeleRollBackTimeOut_nvdVal(uint32 *data)
+ *   Std_ReturnType Rte_Read_ppTeleSpecVer_deVal(uint32 *data)
+ *
+ * Output Interfaces:
+ * ==================
+ *   Explicit S/R API:
+ *   -----------------
+ *   Std_ReturnType Rte_Write_nvwBackupSfStartAddr_nvdVal(uint32 data)
+ *   Std_ReturnType Rte_Write_nvwBackupStatus_nvdVal(uint8 data)
+ *   Std_ReturnType Rte_Write_nvwBufferSfStartAddr_nvdVal(uint32 data)
+ *   Std_ReturnType Rte_Write_nvwTeleRollBackTimeOut_nvdVal(uint32 data)
+ *
+ * Client/Server Interfaces:
+ * =========================
+ *   Server Invocation:
+ *   ------------------
+ *   Std_ReturnType Rte_Call_ppLogCSEvent_LogEvent(uint8 EventType, const uint8 *ReasonCode, uint16 dataRec1, uint16 dataRec2)
+ *     Argument ReasonCode: uint8* is of type iat2Uint8
+ *     Synchronous Server Invocation. Timeout: None
+ *     Returned Application Errors: RTE_E_piLogCSEvent_E_NOT_OK, RTE_E_piLogCSEvent_E_OK
+ *
+ *********************************************************************************************************************/
+/**********************************************************************************************************************
+ * DO NOT CHANGE THIS COMMENT!           << Start of documentation area >>                  DO NOT CHANGE THIS COMMENT!
+ * Symbol: reCddTeleBackupSchdlr_doc
+ *********************************************************************************************************************/
+
+
+/**********************************************************************************************************************
+ * DO NOT CHANGE THIS COMMENT!           << End of documentation area >>                    DO NOT CHANGE THIS COMMENT!
+ *********************************************************************************************************************/
+
+FUNC(void, CDDTeleBackupMngr_CODE) reCddTeleBackupSchdlr(void) /* PRQA S 0624, 3206 */ /* MD_Rte_0624, MD_Rte_3206 */
+{
+/**********************************************************************************************************************
+ * DO NOT CHANGE THIS COMMENT!           << Start of runnable implementation >>             DO NOT CHANGE THIS COMMENT!
+ * Symbol: reCddTeleBackupSchdlr
+ *********************************************************************************************************************/
+	static boolean segment_last_page = FALSE;	//flag to check last page of each segment	
+    static boolean metadata_complete = FALSE;
+	static uint8 backup_attempts = 0;       //retry of backup count
+	static boolean read_flag = FALSE;	//flag to check if reading compelted or not, if read_flag is 1 means read in progress.
+	static boolean metadata_seg_break = FALSE;
+	static boolean last_block_cmac = FALSE;	//flag to check last block of pf
+	static uint32 PF_Addr;	//actaul pf address
+	static uint8 blk_index = 0;	//block index of pf
+	static backup_event_t backup_flag = BACKUP_FULL_ERASE; //Backup state machine flag
+	static boolean metadata_blk_break = FALSE;
+	static volatile tele_dbg_backup_t tele_dbg_backup;
+	static uint32 PF2SF_translate_addr;	//pf address after encrption, different due to IV
+    static uint16 backup_sf_data_size = 0; //values are 496 or 512 or remaining page
+	static volatile metadata_process_t backup_metadata_flag;	//metadata state machine flag
+	static uint16 remaining_page;
+	static uint8 seg_index = 0;	//segment index of each block	   
+	static uint8 *backup_data;
+	static uint16 padding_length = 0;	//last segment page overflow length
+
+	Std_ReturnType ret = 0;
+	uint32 seg_end_addr, block_end_addr, last_block_end_addr;
+	uint16 last_seg_data;  
+	uint8 seg_info[CDDTBM_SEG_INFO_SIZE] ={0};
+	uint8 TeleSfState;
+	uint8 * const tele_null_ptr = NULL_TELEBACKUPMNGR;
+	uint32 TeleSpecVersion;
+	uintptr_t ptr_PFaddr;	
+	
+	if((NVM_Back_up_status != BACKUP_IN_PROGRESS) || (CSU_feature_enable == FALSE))
+	{
+		return;
+	}
+	else
+	{
+		switch (backup_flag)
+		{
+			//default state
+			case NO_REQUEST:
+			{
+				// do nothing
+				break;
+			}
+			//state to erase complete backup region of serial flash
+			// come to this state after init or for three attempts in case of error
+			case BACKUP_FULL_ERASE:
+			{
+				TeleSfState = GetSerialFlashState();
+				if ((TeleSfState == (uint8)SF_REQUEST_COMPLETE) || (TeleSfState == (uint8)SF_NO_REQUEST))
+				{
+					data_transfer_info.region = BACKUP_REGION;
+					data_transfer_info.tele_sf_request_mode = SF_FULL_ERASE;
+					SerialFlashGetServ(&data_transfer_info);
+					TeleSfState = GetSerialFlashState();
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.sm_backup_event_flag = BACKUP_FULL_ERASE;
+					#endif
+					if (TeleSfState != ((uint8)SF_REQUEST_FAIL))
+					{
+						backup_flag = PF_ADDR_HANDLE;
+						//this function call will get all data in Metadata Structure
+						metadata_extract();
+						//starting address of program flash
+						PF_Addr = csu_header_backup.blocks[0].segments[0].source_start_address_pf;
+					}
+					else
+					{
+						#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0x1;
+						#endif
+						backup_flag = BACKUP_RETRY; //due to current SF request
+					}
+				}
+				else if (TeleSfState == ((uint8)SF_REQUEST_FAIL))
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0x2;
+					#endif
+					backup_flag = BACKUP_RETRY; //due to previous SF request
+				}
+				else
+				{
+					//previous SF request in progess so wait in this state
+				}
+				break;
+			}
+			//Next address of onboard flash which will be copied to array is handled in this state
+			//it is done based on segment address, uncompressed size of segment, block number and segment number
+			case PF_ADDR_HANDLE:
+			{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.sm_backup_event_flag = PF_ADDR_HANDLE;
+					#endif	
+					// PF address handling
+					for (blk_index = 0; blk_index < csu_header_backup.number_of_blocks; blk_index++)
+					{
+						for (seg_index = 0; seg_index < csu_header_backup.blocks[blk_index].number_of_segments; seg_index++)
+						{
+							seg_end_addr = (csu_header_backup.blocks[blk_index].segments[seg_index].source_start_address_pf + csu_header_backup.blocks[blk_index].segments[seg_index].uncompress_size);
+							last_seg_data = (uint16)((csu_header_backup.blocks[blk_index].segments[seg_index].uncompress_size + Cipher_IV_LENGTH) % SF_PAGE_SIZE);
+
+							if (PF_Addr < seg_end_addr)
+							{
+								// for start of each segment, generate IV 
+								//last_seg_data is remainder of whole segment divide by page size, as for first page of each segment we conside only 496 for 16 will be added to the remainder																																	  
+								if (PF_Addr == csu_header_backup.blocks[blk_index].segments[seg_index].source_start_address_pf)
+								{
+									csu_header_backup.blocks[blk_index].segments[seg_index].compress_size = 0x0;
+									ret = Csm_RandomGenerate(CsmConf_CsmJob_CsmJobRandomGenerate, Backup_Cipher_IV, &backup_Cipher_IV_Length);
+									if (ret == E_OK)
+									{
+										backup_result_len_encrypt = SF_PAGE_SIZE;
+										PF2SF_translate_addr = PF_Addr;
+										backup_flag = SET_KEYS;
+										return;
+									}
+								}
+								else if (PF_Addr < (seg_end_addr - last_seg_data))
+								{
+									backup_sf_data_size = SF_PAGE_SIZE;
+									backup_result_len_encrypt = SF_PAGE_SIZE;
+									PF2SF_translate_addr += SF_PAGE_SIZE;
+									backup_flag = CYBER_UPDATE;
+									//Handling of case if last page of segment to be written on serial flash is equal to Page size
+									if((last_seg_data == 0) &&(PF_Addr ==(seg_end_addr - SF_PAGE_SIZE)))
+									{
+										segment_last_page = TRUE;
+									}																   
+									return;
+								}
+								else
+								{
+									segment_last_page = TRUE;
+									backup_sf_data_size = (uint16)(seg_end_addr - PF_Addr);
+									backup_result_len_encrypt = backup_sf_data_size;
+									PF2SF_translate_addr += SF_PAGE_SIZE;//PF2SF_translate_addr is the point to start of that page...since previous page was of 512 so increased by 512
+									backup_flag = CYBER_UPDATE;
+									return;
+								}
+								
+							}
+							else if (PF_Addr == seg_end_addr)
+							{
+								if(seg_index < (csu_header_backup.blocks[blk_index].number_of_segments - 1))
+								{
+									PF_Addr = csu_header_backup.blocks[blk_index].segments[seg_index + 1].source_start_address_pf;
+								}
+								else	//this is last seg_index
+								{
+									PF_Addr = csu_header_backup.blocks[blk_index + 1].segments[0].source_start_address_pf;
+								}	
+							}
+							else
+							{
+								
+							}
+						}
+					}
+				
+				break;
+			}
+			// Random IV is generated in this state for each segment
+			case SET_KEYS:
+			{
+				#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+					tele_dbg_backup.sm_backup_event_flag = SET_KEYS;
+				#endif
+				ret = Csm_KeyElementSet((uint32)CsmConf_CsmKey_CsmKey_ECU_Unique_Cipher, (uint32)CryptoConf_CryptoKeyElement_Crypto_30_vHsm_LibCv_Cipher_IV, Backup_Cipher_IV, backup_Cipher_IV_Length);
+				if (ret == E_OK)
+				{
+					ret = Csm_KeySetValid((uint32)CsmConf_CsmKey_CsmKey_ECU_Unique_Cipher);
+					if (ret == E_OK)
+					{
+						ret = Csm_Encrypt((uint32)CsmConf_CsmJob_CsmJobEncryptCals, (Crypto_OperationModeType)CRYPTO_OPERATIONMODE_START, tele_null_ptr, 0x0, backup_encrypt_data, &backup_result_len_encrypt);
+						if (ret == E_OK)
+						{
+							backup_sf_data_size = SF_PAGE_SIZE - Cipher_IV_LENGTH; // 496
+							backup_result_len_encrypt = SF_PAGE_SIZE;
+							ptr_PFaddr = PF_Addr;
+							TeleCsuMemCpy(&Mem_Read_Buff[0], (uint8*)ptr_PFaddr, (uint32)backup_sf_data_size);
+							csu_header_backup.blocks[blk_index].segments[seg_index].compress_size += Cipher_IV_LENGTH;
+							if(seg_index == 0)
+							{
+								backup_flag = CMAC_START;
+							}
+							else
+							{
+								backup_flag = SEG_START_HANDLE;
+							}
+						}
+						else if (ret == CRYPTO_E_BUSY)
+						{
+							#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+								tele_dbg_backup.tele_backup_error_code = 0x3;
+							#endif
+							backup_flag = ENCRYPT_START;
+						}
+						else
+						{
+							#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+								tele_dbg_backup.tele_backup_error_code = 0x4;
+							#endif
+							backup_flag = BACKUP_RETRY;
+						}
+					}
+					else
+					{
+						#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+							tele_dbg_backup.tele_backup_error_code = 0x5;
+						#endif
+						backup_flag = BACKUP_RETRY;
+					}
+				}
+				else if(ret == CRYPTO_E_BUSY)
+				{
+					backup_flag = SET_KEYS;
+				}				 
+				else
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0x6;
+					#endif
+					backup_flag = BACKUP_RETRY;
+				}
+
+				break;
+			}
+			//encryption is stated by passing NULL ptr for each segment
+			case ENCRYPT_START:
+			{
+				#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+					tele_dbg_backup.sm_backup_event_flag = ENCRYPT_START;
+				#endif
+				ret = Csm_Encrypt((uint32)CsmConf_CsmJob_CsmJobEncryptCals, (Crypto_OperationModeType)CRYPTO_OPERATIONMODE_START, tele_null_ptr, 0x0, backup_encrypt_data, &backup_result_len_encrypt);
+				if (ret == E_OK)
+				{
+					backup_sf_data_size = SF_PAGE_SIZE - Cipher_IV_LENGTH; // 496
+					backup_result_len_encrypt = SF_PAGE_SIZE;
+					ptr_PFaddr = PF_Addr;
+					TeleCsuMemCpy(&Mem_Read_Buff[0], (uint8*)ptr_PFaddr, (uint32)backup_sf_data_size);
+					csu_header_backup.blocks[blk_index].segments[seg_index].compress_size += Cipher_IV_LENGTH;
+					if(seg_index == 0)
+					{
+						backup_flag = CMAC_START;
+					}
+					else
+					{
+						backup_flag = SEG_START_HANDLE;
+					}	
+				}
+				else if (ret == CRYPTO_E_BUSY)
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0x7;
+					#endif
+					backup_flag = ENCRYPT_START;
+				}
+				else
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0x8;
+					#endif
+					backup_flag = BACKUP_RETRY;
+				}
+				break;
+			}
+			// in this state CMAC is started by passing null ptr for each block
+			case (CMAC_START):
+			{
+				#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+					tele_dbg_backup.sm_backup_event_flag = CMAC_START;
+				#endif
+				ret = Csm_MacGenerate((uint32)CsmConf_CsmJob_CsmJobCmac_Calculate, (Crypto_OperationModeType)CRYPTO_OPERATIONMODE_START, tele_null_ptr, 0x0,
+									&CMAC_array[0], &backup_cmac_gen_length);
+				if (ret == E_OK)
+				{
+					backup_flag = SEG_START_HANDLE;
+				}
+				else if (ret == CRYPTO_E_BUSY)
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0x9;
+					#endif
+					backup_flag = CMAC_START;
+				}
+				else
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0xA;
+					#endif
+					backup_flag = BACKUP_RETRY;
+				}
+				break;
+			}
+
+			case (SEG_START_HANDLE):
+			{
+				//CMAC also need to be calculated on each segment address and length CR 13648154
+				// keep seg addr and length in big endian
+				#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+					tele_dbg_backup.sm_backup_event_flag = SEG_START_HANDLE;
+				#endif
+				VStdLib_ConvertUint32ToUint8ArrayBigEndian(csu_header_backup.blocks[blk_index].segments[seg_index].source_start_address_pf,&seg_info[0] );
+				VStdLib_ConvertUint32ToUint8ArrayBigEndian(csu_header_backup.blocks[blk_index].segments[seg_index].uncompress_size,&seg_info[4] );
+				ret = Csm_MacGenerate((uint32)CsmConf_CsmJob_CsmJobCmac_Calculate, (Crypto_OperationModeType)CRYPTO_OPERATIONMODE_UPDATE, &seg_info[0], sizeof(seg_info),
+										&CMAC_array[0], &backup_cmac_gen_length);
+				if(ret == E_OK)
+				{
+					backup_flag=CYBER_UPDATE;
+				}
+				else if (ret == CRYPTO_E_BUSY)
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0x20;
+					#endif
+					backup_flag = SEG_START_HANDLE;
+				}
+				else
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0x21;
+					#endif
+					backup_flag = BACKUP_RETRY;
+				}
+				break;
+			}
+			//in this state encrytion and MAC is calculated on array containing data of PF 
+			case (CYBER_UPDATE):
+			{
+				#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+					tele_dbg_backup.sm_backup_event_flag = CYBER_UPDATE;
+				#endif
+				if (backup_sf_data_size == (SF_PAGE_SIZE - Cipher_IV_LENGTH))
+				{
+					ret = Csm_Encrypt((uint32)CsmConf_CsmJob_CsmJobEncryptCals, (Crypto_OperationModeType)CRYPTO_OPERATIONMODE_UPDATE, &Mem_Read_Buff[0], backup_sf_data_size, &backup_encrypt_data[Cipher_IV_LENGTH], &backup_result_len_encrypt);
+					ret |= Csm_MacGenerate((uint32)CsmConf_CsmJob_CsmJobCmac_Calculate, (Crypto_OperationModeType)CRYPTO_OPERATIONMODE_UPDATE, &Mem_Read_Buff[0], backup_sf_data_size,
+										&CMAC_array[0], &backup_cmac_gen_length);
+					TeleCsuMemCpy(&backup_encrypt_data[0], Backup_Cipher_IV, (uint32)Cipher_IV_LENGTH);
+				}
+				else
+				{
+					ptr_PFaddr = PF_Addr;
+					TeleCsuMemCpy(&Mem_Read_Buff[0], (uint8*)ptr_PFaddr, (uint32)backup_sf_data_size);
+					ret = Csm_Encrypt((uint32)CsmConf_CsmJob_CsmJobEncryptCals, (Crypto_OperationModeType)CRYPTO_OPERATIONMODE_UPDATE, &Mem_Read_Buff[0], backup_sf_data_size, &backup_encrypt_data[0], &backup_result_len_encrypt);
+					ret |= Csm_MacGenerate((uint32)CsmConf_CsmJob_CsmJobCmac_Calculate, (Crypto_OperationModeType)CRYPTO_OPERATIONMODE_UPDATE, &Mem_Read_Buff[0], backup_sf_data_size,
+										&CMAC_array[0], &backup_cmac_gen_length);
+					
+				}
+				csu_header_backup.blocks[blk_index].segments[seg_index].compress_size += backup_result_len_encrypt;
+				if (ret == E_OK)
+				{
+					if((segment_last_page == 1)&&(backup_result_len_encrypt <= SF_PAGE_SIZE))
+					{
+						backup_flag = ENCRYPT_FINISH;
+					}
+					else
+					{
+						backup_flag = WRITE_TO_SF;
+					}
+				}
+				else if (ret == CRYPTO_E_BUSY)
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0xB;
+					#endif
+					backup_flag = CYBER_UPDATE;
+				}
+				else
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0xC;
+					#endif
+					backup_flag = BACKUP_RETRY;
+				}
+				break;
+			}
+			//Encrytion finish for each segment by passing null ptr
+			case (ENCRYPT_FINISH):
+			{
+				#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+					tele_dbg_backup.sm_backup_event_flag = ENCRYPT_FINISH;
+				#endif
+				ret = Csm_Encrypt((uint32)CsmConf_CsmJob_CsmJobEncryptCals, (Crypto_OperationModeType)CRYPTO_OPERATIONMODE_FINISH, tele_null_ptr, 0x0, &Backup_Cipher_IV[0], &backup_Cipher_IV_Length);
+								
+				if((backup_result_len_encrypt + backup_Cipher_IV_Length) <= SF_PAGE_SIZE)
+				{
+					// as backup_encrypt_data lenth is not overflow, remaining bytes can be added
+					//ret = Csm_Encrypt((uint32)CsmConf_CsmJob_CsmJobEncryptCals, (Crypto_OperationModeType)CRYPTO_OPERATIONMODE_FINISH, tele_null_ptr, 0x0, &backup_encrypt_data[backup_result_len_encrypt], &backup_Cipher_IV_Length);
+					padding_length = 0;
+					segment_last_page = FALSE;
+				}
+				else
+				{
+					//if backup_encrypt_data length is more than 16
+					//first take the remaining bytes in different array i.e. Backup_Cipher_IV
+					//then calculate the overflow bytes in padding length
+					//start adding last bytes in backup_encrypt_data array. only padding bytes will remain
+					//that will be taken care in WRITE_TO_SF case
+					//ret = Csm_Encrypt((uint32)CsmConf_CsmJob_CsmJobEncryptCals, (Crypto_OperationModeType)CRYPTO_OPERATIONMODE_FINISH, tele_null_ptr, 0x0, &Backup_Cipher_IV[0], &backup_Cipher_IV_Length);
+					padding_length = (uint16)((uint16)backup_result_len_encrypt + (uint16)backup_Cipher_IV_Length) - SF_PAGE_SIZE;	
+				}
+				for(uint16 backup_encrypt_index = 0; backup_encrypt_index < (backup_Cipher_IV_Length - padding_length); backup_encrypt_index++)
+				{
+					backup_encrypt_data[backup_result_len_encrypt + backup_encrypt_index] = Backup_Cipher_IV[backup_encrypt_index];
+				}
+				csu_header_backup.blocks[blk_index].segments[seg_index].compress_size += backup_Cipher_IV_Length;
+				
+				if (ret == E_OK)
+				{
+					backup_flag = WRITE_TO_SF;
+				}
+				else
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0xD;
+					#endif
+					backup_flag = BACKUP_RETRY;
+				}
+
+				break;
+			}
+			//this dtate is for CMAC finish for each block by passing null ptr
+			case (CMAC_FINISH):
+			{
+				#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+					tele_dbg_backup.sm_backup_event_flag = CMAC_FINISH;
+				#endif
+				ret = Csm_MacGenerate((uint32)CsmConf_CsmJob_CsmJobCmac_Calculate, (Crypto_OperationModeType)CRYPTO_OPERATIONMODE_FINISH, tele_null_ptr, 0x0,
+									&CMAC_array[0], &backup_cmac_gen_length);
+				if (ret == E_OK)
+				{
+					backup_flag = CMAC_WRITE;
+				}
+				else
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0xE;
+					#endif
+					backup_flag = BACKUP_RETRY;
+				}
+				break;
+			}
+			//in this encrypted data is stored to SF 
+			case (WRITE_TO_SF):
+			{
+				#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+					tele_dbg_backup.sm_backup_event_flag = WRITE_TO_SF;
+				#endif
+				TeleSfState = GetSerialFlashState();
+				if ((TeleSfState == (uint8)SF_REQUEST_COMPLETE) || (TeleSfState == (uint8)SF_NO_REQUEST))
+				{
+					data_transfer_info.source_address_pf = PF2SF_translate_addr;
+					data_transfer_info.data_ptr = &backup_encrypt_data[0];
+					data_transfer_info.tele_sf_request_length = sizeof(backup_encrypt_data);
+					data_transfer_info.region = BACKUP_REGION;
+					data_transfer_info.tele_sf_request_mode = SF_DATA_TRANSFER;
+					SerialFlashGetServ(&data_transfer_info);
+					TeleSfState = GetSerialFlashState();
+					if (TeleSfState != (uint8)SF_REQUEST_FAIL)
+					{
+						backup_flag = BACKUP_READ_SF_DATA;			
+					}
+					else
+					{
+						#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+							tele_dbg_backup.tele_backup_error_code = 0x0F;
+						#endif
+						backup_flag = BACKUP_RETRY;	//due to current SF request
+					}
+				}
+				else if (TeleSfState == (uint8)SF_REQUEST_FAIL)
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0x10;
+					#endif
+					backup_flag = BACKUP_RETRY; //due to previous SF request
+				}
+				else
+				{
+					//previous SF request in progess so wait in this state
+				}
+				break;
+			}
+			//In this state, read the data back from SF to array and compare with what is write array,
+			//if both matches, proceed to next page
+			//else retry to do backup again 
+			case (BACKUP_READ_SF_DATA):
+			{
+				#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+					tele_dbg_backup.sm_backup_event_flag = BACKUP_READ_SF_DATA;
+				#endif
+				TeleSfState = GetSerialFlashState();
+				if ((TeleSfState == (uint8)SF_REQUEST_COMPLETE) || (TeleSfState == (uint8)SF_NO_REQUEST))
+				{
+					if(read_flag == 0)
+					{
+						data_transfer_info.source_address_pf = PF2SF_translate_addr;
+						data_transfer_info.data_ptr = &Mem_Read_Buff[0];
+						data_transfer_info.tele_sf_request_length = sizeof(Mem_Read_Buff);
+						data_transfer_info.region = BACKUP_REGION;
+						data_transfer_info.tele_sf_request_mode = SF_READ_DATA;
+						SerialFlashGetServ(&data_transfer_info);
+						TeleSfState = GetSerialFlashState();
+						if (TeleSfState != (uint8)SF_REQUEST_FAIL)
+						{
+							read_flag = TRUE;
+						}
+						else
+						{
+							#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+								tele_dbg_backup.tele_backup_error_code = 0x1C;
+							#endif
+							backup_flag = BACKUP_RETRY;	//due to current SF request
+						}
+					}
+					else
+					{
+						read_flag = FALSE;
+						for (uint16 read_index = 0; read_index < SF_PAGE_SIZE; read_index++)
+						{
+							if(Mem_Read_Buff[read_index] != backup_encrypt_data[read_index])
+							{
+								#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+								tele_dbg_backup.tele_backup_error_code = 0x1D;
+								#endif
+								backup_flag = BACKUP_RETRY;	//due to current SF request
+								return;
+							}
+							else
+							{
+								//continue check for index, as for this index both are eqaul
+							}
+						}
+
+						if(padding_length != 0)
+						{
+							PF2SF_translate_addr += SF_PAGE_SIZE;
+							for(uint16 backup_encrypt_index = 0; backup_encrypt_index < (padding_length); backup_encrypt_index++)
+							{
+								backup_encrypt_data[backup_encrypt_index] = Backup_Cipher_IV[(Cipher_IV_LENGTH - padding_length) + backup_encrypt_index];
+							}
+							padding_length = 0;
+							segment_last_page = FALSE;
+							backup_flag = WRITE_TO_SF;
+						}
+						else
+						{
+							PF_Addr += backup_sf_data_size;
+							//checking for last segment address of the block
+							block_end_addr = ((csu_header_backup.blocks[blk_index].segments[csu_header_backup.blocks[blk_index].number_of_segments - 1].source_start_address_pf) + (csu_header_backup.blocks[blk_index].segments[csu_header_backup.blocks[blk_index].number_of_segments - 1].uncompress_size));
+							if (PF_Addr == block_end_addr)
+							{
+								backup_flag = CMAC_FINISH;
+								//check for last block last segment addr
+								last_block_end_addr = ((csu_header_backup.blocks[csu_header_backup.number_of_blocks - 1].segments[csu_header_backup.blocks[csu_header_backup.number_of_blocks - 1].number_of_segments - 1].source_start_address_pf) + (csu_header_backup.blocks[csu_header_backup.number_of_blocks - 1].segments[csu_header_backup.blocks[csu_header_backup.number_of_blocks - 1].number_of_segments - 1].uncompress_size));
+								if (PF_Addr == last_block_end_addr)
+								{
+									last_block_cmac = TRUE;
+								}						
+							}
+							else
+							{
+								backup_flag = PF_ADDR_HANDLE;
+							}
+						}
+							
+
+					}
+				}
+				break;
+			}
+			// this state is to store the each block CMAC to SF
+			case (CMAC_WRITE):
+			{
+				#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+					tele_dbg_backup.sm_backup_event_flag = CMAC_WRITE;
+				#endif
+				TeleSfState = GetSerialFlashState();
+				if ((TeleSfState == ((uint8)SF_REQUEST_COMPLETE)) || (TeleSfState == ((uint8)SF_NO_REQUEST)))
+				{
+					data_transfer_info.source_address_pf = block_cmac_addr_reference;
+					data_transfer_info.data_ptr = &CMAC_array[0];
+					data_transfer_info.tele_sf_request_length = sizeof(CMAC_array);
+					data_transfer_info.region = BACKUP_REGION;
+					data_transfer_info.tele_sf_request_mode = SF_DATA_TRANSFER;
+					SerialFlashGetServ(&data_transfer_info);
+					TeleSfState = GetSerialFlashState();
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.sm_backup_event_flag = CMAC_WRITE;
+					#endif
+					if ((TeleSfState != (uint8)SF_REQUEST_FAIL) && (last_block_cmac != 1))
+					{
+						block_cmac_addr_reference += SF_PAGE_SIZE;
+						backup_flag = PF_ADDR_HANDLE;
+					}
+					else if ((TeleSfState != (uint8)SF_REQUEST_FAIL) && (last_block_cmac == 1))
+					{
+						backup_flag = NO_REQUEST;
+						//reset blk & segment index for metadata array
+						blk_index = 0;
+						seg_index = 0;
+						backup_metadata_flag = METADATA_CMAC_START;
+						data_transfer_info.source_address_pf = METADATA_REF_ADDRESS;	// reference for metadata start
+						//data_transfer_info.source_address_pf = csu_header_backup.blocks[0].segments[0].source_start_address_pf;
+					}
+					else
+					{
+						#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+							tele_dbg_backup.tele_backup_error_code = 0x11;
+						#endif
+						backup_flag = BACKUP_RETRY;	//due to current SF request
+					}
+				}
+				else if (TeleSfState == (uint8)SF_REQUEST_FAIL)
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0x12;
+					#endif
+					backup_flag = BACKUP_RETRY; //due to previous SF request
+				}
+				else
+				{
+					//previous SF request in progess so wait in this state
+				}
+				break;
+			}
+			//in case of any failure, three attampts are made fromthis state
+			case (BACKUP_RETRY):
+			{
+				#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+					tele_dbg_backup.sm_backup_event_flag = BACKUP_RETRY;
+				#endif
+				backup_attempts += 1;
+				if (backup_attempts <= 3)
+				{
+					backup_flag = BACKUP_FULL_ERASE;
+				}
+				else
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0x13;
+					#endif
+					NVM_Back_up_status = BACKUP_FAILED;
+					(void)Rte_Write_nvwBackupStatus_nvdVal((uint8)NVM_Back_up_status);
+					(void)Rte_Call_ppLogCSEvent_LogEvent((uint8)UPDATE_FAILURE, &Update_Failure_ReasonCode[0],0xFFu,0xFFu);
+					backup_flag = NO_REQUEST;
+					NvM_backup_update = TRUE;
+				}
+				break;
+			}
+			//Update NVM parameter once backup complete
+			case (BACKUP_COMPLETE):
+			{
+				#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+					tele_dbg_backup.sm_backup_event_flag = BACKUP_COMPLETE;
+				#endif
+				TeleSfState = GetSerialFlashState();
+				if ((TeleSfState == (uint8)SF_REQUEST_COMPLETE) || (TeleSfState == (uint8)SF_NO_REQUEST))
+				{
+					NVM_Back_up_status = BACKUP_COMPLT_VALID;
+					(void)Rte_Write_nvwBackupStatus_nvdVal((uint8)NVM_Back_up_status);
+					(void)Rte_Write_nvwPortOverstatus_nvdVal((uint8)PORTOVER_DEFAULT);
+					backup_flag = NO_REQUEST;
+					NvM_backup_update = TRUE;
+				}
+				else if (TeleSfState == (uint8)SF_REQUEST_FAIL)
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0x16;
+					#endif
+					backup_flag = BACKUP_RETRY; //due to previous SF request
+				}
+				else
+				{
+					//previous SF request in progess so wait in this state
+				}
+				break;
+			}
+			default:
+			{
+				/* Do nothing. */
+			}
+			break;
+		}
+
+		switch (backup_metadata_flag)
+		{
+			//default case
+			case METADATA_NO_REQUEST:
+			{
+				break;
+			}
+			//metadata information is copied to array in this state, and remaining metadata are also handled
+			case METADATA_ARRAY_HANDLING:
+			{
+				#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+					tele_dbg_backup.sm_metadata_process_flag = METADATA_ARRAY_HANDLING;
+				#endif
+				if((metadata_blk_break == 0) &&  (metadata_seg_break == 0))
+				{
+					// Block level structure start, for loop for block
+					for (uint8 meta_blk_index = blk_index; meta_blk_index < csu_header_backup.number_of_blocks; meta_blk_index++)
+					{
+						blk_index = meta_blk_index;
+						TeleCsuMemCpy(backup_data, (uint8*)&csu_header_backup.blocks[meta_blk_index].number_of_segments, sizeof(csu_header_backup.blocks[meta_blk_index].number_of_segments));
+						
+						backup_data = backup_data + sizeof(csu_header_backup.blocks[meta_blk_index].number_of_segments);
+						
+						for (uint8 meta_seg_index = 0; meta_seg_index < (csu_header_backup.blocks[meta_blk_index].number_of_segments); meta_seg_index++)
+						{
+							seg_index = meta_seg_index;
+							TeleCsuMemCpy(backup_data, (uint8*)&csu_header_backup.blocks[meta_blk_index].segments[meta_seg_index], sizeof(csu_header_backup.blocks[meta_blk_index].segments[meta_seg_index]));
+							backup_data = backup_data + sizeof(csu_header_backup.blocks[meta_blk_index].segments[meta_seg_index]);
+							if(backup_data > &backup_matadata_array[SF_PAGE_SIZE - 1])
+							{
+								remaining_page = (uint16)(backup_data - &backup_matadata_array[SF_PAGE_SIZE]);
+								metadata_seg_break = TRUE;
+								/* backup_metadata_flag = METADATA_CMAC_UPDATE */
+								break;
+							}
+						}
+						
+						// values of below block level data are zero
+						for (uint16 empty_index = 0; empty_index < BLOCK_CYBER_HEADER_LENGTH; empty_index++)
+						{
+							*backup_data = 0;
+							backup_data++;   
+						}
+						backup_metadata_flag = METADATA_CMAC_UPDATE;
+
+						if(blk_index == (csu_header_backup.number_of_blocks - 1))
+						{
+							metadata_complete = TRUE;
+						}
+						else 
+						{
+							metadata_complete = FALSE;
+							if((backup_data) > &backup_matadata_array[SF_PAGE_SIZE - 1])
+							{
+								remaining_page = (uint16)(backup_data - &backup_matadata_array[SF_PAGE_SIZE]);
+								metadata_blk_break = TRUE;
+							}
+						}
+						if ((metadata_complete == TRUE) || (metadata_blk_break == TRUE)) 
+						{
+							break;
+						}
+						else
+						{
+							/* Do nothing */
+						}
+					}
+				}
+				else if((metadata_seg_break == 1) &&(metadata_blk_break == 0))
+				{
+					for(uint16 backup_metadata_index = 0; backup_metadata_index < remaining_page; backup_metadata_index++)
+					{
+						backup_matadata_array[backup_metadata_index] = backup_matadata_array[SF_PAGE_SIZE + backup_metadata_index];
+					}
+					backup_data = &backup_matadata_array[remaining_page];
+					
+					for (uint8 meta_seg_index = seg_index; meta_seg_index < (csu_header_backup.blocks[blk_index].number_of_segments); meta_seg_index++)
+					{
+						seg_index = meta_seg_index;
+						TeleCsuMemCpy(backup_data, (uint8*)&csu_header_backup.blocks[blk_index].segments[meta_seg_index], sizeof(csu_header_backup.blocks[blk_index].segments[meta_seg_index]));
+						backup_data = backup_data + sizeof(csu_header_backup.blocks[blk_index].segments[meta_seg_index]);
+						if(backup_data > &backup_matadata_array[SF_PAGE_SIZE - 1])
+						{
+							remaining_page = (uint16)(backup_data - &backup_matadata_array[SF_PAGE_SIZE]);
+							metadata_seg_break = TRUE;
+							
+							break;
+						}
+					}
+					
+					// values of below block level data are zero
+					for (uint16 empty_index = 0; empty_index < BLOCK_CYBER_HEADER_LENGTH; empty_index++)
+					{
+						*backup_data = 0;
+						backup_data++;
+					}
+					backup_metadata_flag = METADATA_CMAC_UPDATE;
+
+					if(blk_index == csu_header_backup.number_of_blocks)
+					{
+						metadata_complete = TRUE;
+						break;
+					}
+					else 
+					{
+						metadata_complete = FALSE;
+						blk_index++;
+						if((backup_data) > &backup_matadata_array[SF_PAGE_SIZE - 1])
+						{
+							remaining_page = (uint16)(backup_data - &backup_matadata_array[SF_PAGE_SIZE]);
+							metadata_blk_break = TRUE;
+							metadata_seg_break = FALSE;//reset as segment break case handled
+							break;
+						}
+						else
+						{
+							metadata_blk_break = FALSE;//since need to go for remaining block case1
+							backup_metadata_flag = METADATA_ARRAY_HANDLING;
+							break;
+						}
+					}
+					
+				}
+				else if((metadata_seg_break == 0) &&(metadata_blk_break == 1) &&(metadata_complete == 0))
+				{
+					for(uint16 backup_metadata_index = 0; backup_metadata_index < remaining_page; backup_metadata_index++)
+					{
+						backup_matadata_array[backup_metadata_index] = backup_matadata_array[SF_PAGE_SIZE + backup_metadata_index];
+					}
+					backup_data = &backup_matadata_array[remaining_page];
+					metadata_blk_break = FALSE;//since need to go for remaining block case1
+					blk_index++;
+					break;
+				}
+				else
+				{
+				    /* Do nothing */
+				}
+				
+				break;
+			}
+			//in this state, CMAC calculation for metadata started by passing null ptr
+			//metadata fix structure information is also copied in array
+			case METADATA_CMAC_START:
+			{
+				#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+					tele_dbg_backup.sm_metadata_process_flag = METADATA_CMAC_START;
+				#endif
+				ret = Csm_MacGenerate((uint32)CsmConf_CsmJob_CsmJobCmac_Calculate, (Crypto_OperationModeType)CRYPTO_OPERATIONMODE_START, tele_null_ptr, 0x0,
+								&CMAC_array[0], &backup_cmac_gen_length);
+				if (ret == E_OK)
+				{
+					// common data
+					backup_data = &backup_matadata_array[0];
+					*backup_data = csu_header_backup.number_of_blocks;
+					backup_data++;
+					for (uint8 empty_index = 0; empty_index < SEG_INFO_SIZE; empty_index++)
+					{
+						*backup_data = 0;
+						backup_data++;
+					}
+					(void)Rte_Read_ppTeleSpecVer_deVal(&TeleSpecVersion);
+					csu_header_backup.Telematics_spec_version = TeleSpecVersion;
+					TeleCsuMemCpy(backup_data, (uint8*)&csu_header_backup.Telematics_spec_version, sizeof(csu_header_backup.Telematics_spec_version));
+					backup_data = backup_data + sizeof(csu_header_backup.Telematics_spec_version);
+					for (uint8 empty_index = 0; empty_index < BACKUP_DATA_SIZE; empty_index++)
+					{
+						*backup_data = 0;
+						backup_data++;
+					}
+					backup_metadata_flag = METADATA_ARRAY_HANDLING;
+				}
+				else if (ret == CRYPTO_E_BUSY)
+				{
+					backup_metadata_flag = METADATA_CMAC_START;
+				}
+				else
+				{	
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0x17;
+					#endif
+					backup_metadata_flag = METADATA_NO_REQUEST;
+					backup_flag = BACKUP_RETRY;
+				}
+				break;
+			}
+			// in this state CMAC is calculated on matadata array
+			case METADATA_CMAC_UPDATE:
+			{
+				#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+					tele_dbg_backup.sm_metadata_process_flag = METADATA_CMAC_UPDATE;
+				#endif
+				ret = Csm_MacGenerate((uint32)CsmConf_CsmJob_CsmJobCmac_Calculate, (Crypto_OperationModeType)CRYPTO_OPERATIONMODE_UPDATE, &backup_matadata_array[0], ((uint32)(metadata_length - (uint32)CMAC_GEN_LENGTH)),
+									&CMAC_array[0], &backup_cmac_gen_length);
+				if (ret == E_OK)
+				{
+					if(metadata_complete == 1)
+					{
+						backup_metadata_flag = METADATA_CMAC_FINISH;
+					}
+					else
+					{
+						backup_metadata_flag = METADATA_WRITE;
+					}
+				}
+				else if (ret == CRYPTO_E_BUSY)
+				{
+					backup_metadata_flag = METADATA_CMAC_UPDATE;
+				}
+				else
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+						tele_dbg_backup.tele_backup_error_code = 0x18;
+					#endif
+					backup_metadata_flag = METADATA_NO_REQUEST;
+					backup_flag = BACKUP_RETRY;
+				}
+				break;
+			}
+			//metatdata array is stored to SF
+			// metadata CMAC is also stored at the end of metadata array
+			case (METADATA_WRITE):
+			{
+				#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+					tele_dbg_backup.sm_metadata_process_flag = METADATA_WRITE;
+				#endif
+				// write to serial flash will be handled later
+				TeleSfState = GetSerialFlashState();
+				if ((TeleSfState == (uint8)SF_REQUEST_COMPLETE) || (TeleSfState == (uint8)SF_NO_REQUEST))
+				{
+					
+					data_transfer_info.data_ptr = &backup_matadata_array[0];
+					data_transfer_info.tele_sf_request_length = SF_PAGE_SIZE;
+					data_transfer_info.region = BACKUP_REGION;
+					data_transfer_info.tele_sf_request_mode = SF_DATA_TRANSFER;
+					SerialFlashGetServ(&data_transfer_info);
+					TeleSfState = GetSerialFlashState();
+					if ((TeleSfState != (uint8)SF_REQUEST_FAIL) && (metadata_complete != 1))
+					{
+						data_transfer_info.source_address_pf += SF_PAGE_SIZE;
+						backup_metadata_flag = METADATA_ARRAY_HANDLING;
+					}
+					else if ((TeleSfState != (uint8)SF_REQUEST_FAIL) && (metadata_complete == 1))
+					{
+						if(backup_data > &backup_matadata_array[SF_PAGE_SIZE - 1])
+						{
+							data_transfer_info.source_address_pf += SF_PAGE_SIZE;
+							remaining_page = (uint16)(backup_data - &backup_matadata_array[SF_PAGE_SIZE - 1U]);
+							for(uint16 backup_metadata_index = 0; backup_metadata_index < remaining_page; backup_metadata_index++)
+							{
+								backup_matadata_array[backup_metadata_index] = backup_matadata_array[SF_PAGE_SIZE + backup_metadata_index];
+							}
+							backup_data = &backup_matadata_array[0];
+							backup_metadata_flag = METADATA_WRITE;
+						}
+						else
+						{
+							backup_flag = BACKUP_COMPLETE;
+							backup_metadata_flag = METADATA_NO_REQUEST;
+						}
+						
+					}
+					else
+					{
+						#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+							tele_dbg_backup.tele_backup_error_code = 0x19;
+						#endif
+						backup_metadata_flag = METADATA_NO_REQUEST;
+						backup_flag = BACKUP_RETRY;	//due to current SF req
+					}
+				}
+				else if (TeleSfState == (uint8)SF_REQUEST_FAIL)
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+							tele_dbg_backup.tele_backup_error_code = 0x1A;
+					#endif
+					backup_metadata_flag = METADATA_NO_REQUEST;
+					backup_flag = BACKUP_RETRY;	//due to previous SF req
+				}
+				else
+				{
+					// wait as SF is busy, stay in this State machine
+				}
+				break;
+			}
+			//Metdata CMAC operation is completed in this state
+			case METADATA_CMAC_FINISH:
+			{	
+				#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+					tele_dbg_backup.sm_metadata_process_flag = METADATA_CMAC_FINISH;
+				#endif
+				ret = Csm_MacGenerate((uint32)CsmConf_CsmJob_CsmJobCmac_Calculate, (Crypto_OperationModeType)CRYPTO_OPERATIONMODE_FINISH, tele_null_ptr, 0x0,
+									&CMAC_array[0], &backup_cmac_gen_length);
+				if (ret == E_OK)
+				{
+					TeleCsuMemCpy(backup_data, &CMAC_array[0], sizeof(CMAC_array));
+					backup_data = backup_data + sizeof(CMAC_array);
+					backup_metadata_flag = METADATA_WRITE;
+				}
+				else
+				{
+					#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+							tele_dbg_backup.tele_backup_error_code = 0x1B;
+					#endif
+					backup_metadata_flag = METADATA_NO_REQUEST;
+					backup_flag = BACKUP_RETRY;
+				}
+				break;
+			}
+			default:
+			{
+				/* Do nothing. */
+			}
+			break;
+			
+		}
+		
+
+		if((NvM_backup_update == TRUE))
+		{
+			(void)NvM_GetErrorStatus(NvMConf_NvMBlockDescriptor_NvbswcBootSharedBootSharedFBLGeneral, &NvM_Error_status);
+			if(NvM_Error_status == E_OK)
+			{
+				schdlr_NvM_WriteBlock_rtn = NvM_WriteBlock(NvMConf_NvMBlockDescriptor_NvbswcBootSharedBootSharedFBLGeneral, NULL_PTR);
+				NvM_backup_update = FALSE;
+			}
+			else
+			{
+				/* DO NOTHING */
+			}
+	
+		}
+		else
+		{
+			/* DO NOTHING */
+		}
+		#if ( DBG_TELE_CSU_BACKUP == STD_ON )
+			tele_dbg_backup.cmac_reference_addr = block_cmac_addr_reference;
+			tele_dbg_backup.sf_reference_addr = PF2SF_translate_addr;
+			tele_dbg_backup.pf_read_addr = PF_Addr;
+			tele_dbg_backup.blk_index = blk_index;
+			tele_dbg_backup.seg_index = seg_index;
+		#endif
+
+	}
+	
+/**********************************************************************************************************************
+ * DO NOT CHANGE THIS COMMENT!           << End of runnable implementation >>               DO NOT CHANGE THIS COMMENT!
+ *********************************************************************************************************************/
+}
+
+/**********************************************************************************************************************
+ *
+ * Runnable Entity Name: reTeleRollBackTimeCheck
+ *
+ *---------------------------------------------------------------------------------------------------------------------
+ *
+ * Executed if at least one of the following trigger conditions occurred:
+ *   - triggered on TimingEvent every 5s
+ *
+ **********************************************************************************************************************
+ *
+ * Input Interfaces:
+ * =================
+ *   Explicit S/R API:
+ *   -----------------
+ *   Std_ReturnType Rte_Read_nvrRollBackTimerStatus_nvdVal(uint8 *data)
+ *   Std_ReturnType Rte_Read_nvrTeleRollBackTimeOut_nvdVal(uint32 *data)
+ *
+ * Output Interfaces:
+ * ==================
+ *   Explicit S/R API:
+ *   -----------------
+ *   Std_ReturnType Rte_Write_nvwRollBackTimerStatus_nvdVal(uint8 data)
+ *   Std_ReturnType Rte_Write_nvwTeleRollBackTimeOut_nvdVal(uint32 data)
+ *
+ *********************************************************************************************************************/
+/**********************************************************************************************************************
+ * DO NOT CHANGE THIS COMMENT!           << Start of documentation area >>                  DO NOT CHANGE THIS COMMENT!
+ * Symbol: reTeleRollBackTimeCheck_doc
+ *********************************************************************************************************************/
+
+
+/**********************************************************************************************************************
+ * DO NOT CHANGE THIS COMMENT!           << End of documentation area >>                    DO NOT CHANGE THIS COMMENT!
+ *********************************************************************************************************************/
+
+FUNC(void, CDDTeleBackupMngr_CODE) reTeleRollBackTimeCheck(void) /* PRQA S 0624, 3206 */ /* MD_Rte_0624, MD_Rte_3206 */
+{
+/**********************************************************************************************************************
+ * DO NOT CHANGE THIS COMMENT!           << Start of runnable implementation >>             DO NOT CHANGE THIS COMMENT!
+ * Symbol: reTeleRollBackTimeCheck
+ *********************************************************************************************************************/
+	//(void)Rte_Read_nvrBackupStatus_nvdVal(&NVM_Back_up_status);
+	(void)Rte_Read_nvrRollBackTimerStatus_nvdVal(&Rollback_timer_status);
+	if ((Rollback_timer_status == TRUE) && (CSU_feature_enable == TRUE))
+	{
+		(void)Rte_Read_nvrTeleRollBackTimeOut_nvdVal(&TeleRollBackTimeOut);
+		if (TeleRollBackTimeOut >= Rte_CData_caTeleRollBackTimer())
+		{
+			//once the rollback timer expire, backup process starts. It will set the status as Backup_in_progress
+			NVM_Back_up_status = BACKUP_IN_PROGRESS;
+			(void)Rte_Write_nvwBackupStatus_nvdVal((uint8)NVM_Back_up_status);
+			Rollback_timer_status = 0;
+			(void)Rte_Write_nvwRollBackTimerStatus_nvdVal(Rollback_timer_status);
+		}
+		else
+		{
+			//increment the timer by 5sec
+			TeleRollBackTimeOut += 5;
+		}
+		(void)Rte_Write_nvwTeleRollBackTimeOut_nvdVal(TeleRollBackTimeOut);
+
+		Rollback_NvM_WriteBlock_rtn = NvM_WriteBlock(NvMConf_NvMBlockDescriptor_NvbswcBootSharedBootSharedFBLGeneral, NULL_PTR);
+		if(Rollback_NvM_WriteBlock_rtn == E_NOT_OK)
+		{
+			NvM_backup_update = TRUE;
+		}
+		else
+		{
+			/* DO NOTHING */
+		}
+
+	}
+
+/**********************************************************************************************************************
+ * DO NOT CHANGE THIS COMMENT!           << End of runnable implementation >>               DO NOT CHANGE THIS COMMENT!
+ *********************************************************************************************************************/
+}
+
+
+#define CDDTeleBackupMngr_STOP_SEC_CODE
+#include "CDDTeleBackupMngr_MemMap.h" /* PRQA S 5087 */ /* MD_MSR_MemMap */
+
+
+/**********************************************************************************************************************
+ * DO NOT CHANGE THIS COMMENT!           << Start of function definition area >>            DO NOT CHANGE THIS COMMENT!
+ *********************************************************************************************************************/
+static void metadata_extract(void)
+{
+	uint16 cmac_padding;
+	/*************lebels will be added, need to change is bloack or segment change*********************/
+	csu_header_backup.number_of_blocks = telematics_csu_block_count;
+	
+	for(uint8 metadata_extract_index = 0; metadata_extract_index < csu_header_backup.number_of_blocks; metadata_extract_index++)
+	{
+		csu_header_backup.blocks[metadata_extract_index].number_of_segments = telematics_csu_table[metadata_extract_index].number_of_segments;
+		telematics_csu_seg* seg_info = telematics_csu_table[metadata_extract_index].segments;
+		for(uint8 seg_ind = 0; seg_ind < csu_header_backup.blocks[metadata_extract_index].number_of_segments; seg_ind++)
+		{
+			csu_header_backup.blocks[metadata_extract_index].segments[seg_ind].source_start_address_pf = seg_info->address;
+			csu_header_backup.blocks[metadata_extract_index].segments[seg_ind].uncompress_size = seg_info->size;
+			seg_info++;
+		}
+		
+	}
+	
+	/**************************************************************************************************/
+	//SF address reference calculation for block CMAC writing
+	metadata_length = (uint16)(CSU_METADATA_STRUCT_FIX_LENGTH + ((uint16)csu_header_backup.number_of_blocks *((uint16)BLOCK_CYBER_HEADER_LENGTH + (uint16)0x1u)) + ((uint16)(csu_header_backup.blocks[0].number_of_segments + (uint16)csu_header_backup.blocks[1].number_of_segments + (uint16)csu_header_backup.blocks[2].number_of_segments)*(uint16)SEGMENT_DATA_STRUCT_LENGTH) + (uint16)CMAC_GEN_LENGTH);
+	cmac_padding = SF_PAGE_SIZE - (metadata_length % SF_PAGE_SIZE);
+	//pre calculation of header length to get the reference address for BLOCK CMAC address translation
+	block_cmac_addr_reference = METADATA_REF_ADDRESS + (uint32)cmac_padding + (uint32)metadata_length;
+	
+}
+
+						   
+
+/**********************************************************************************************************************
+ * DO NOT CHANGE THIS COMMENT!           << End of function definition area >>              DO NOT CHANGE THIS COMMENT!
+ *********************************************************************************************************************/
+
+
+/**********************************************************************************************************************
+ * DO NOT CHANGE THIS COMMENT!           << Start of removed code area >>                   DO NOT CHANGE THIS COMMENT!
+ *********************************************************************************************************************/
+
+
+/**********************************************************************************************************************
+ * DO NOT CHANGE THIS COMMENT!           << End of removed code area >>                     DO NOT CHANGE THIS COMMENT!
+ *********************************************************************************************************************/
+
+/**********************************************************************************************************************
+ MISRA 2012 violations and justifications
+ *********************************************************************************************************************/
+
+/* module specific MISRA deviations:
+   MD_Rte_0624:  MISRA rule: Rule8.3
+     Reason:     This MISRA violation is a consequence from the RTE requirements [SWS_Rte_01007] [SWS_Rte_01150].
+                 The typedefs are never used in the same context.
+     Risk:       No functional risk. Only a cast to uint8* is performed.
+     Prevention: Not required.
+
+   MD_Rte_3206:  MISRA rule: Rule2.7
+     Reason:     The parameters are not used by the code in all possible code variants.
+     Risk:       No functional risk.
+     Prevention: Not required.
+
+*/
